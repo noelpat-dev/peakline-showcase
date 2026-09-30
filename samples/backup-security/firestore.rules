@@ -1,0 +1,397 @@
+// Excerpt from Peakline (private repository), shared for portfolio review.
+// © 2026 Noel Patricks. All rights reserved. Not licensed for reuse.
+// Source: firestore.rules
+
+rules_version = '2';
+
+// Peakline encrypted backup, Spark layout (no Cloud Functions, no Storage).
+//
+//   users/{uid}/backup/state                       pointer: which slot is current
+//   users/{uid}/backup/state/slots/{a|b}           slot manifest
+//   users/{uid}/backup/state/slots/{a|b}/chunks/N  ciphertext chunks, N = 0..chunkCount-1
+//
+// Each user owns exactly two slots, so stored data is bounded by design
+// (2 slots x at most 48 chunks x 640 KB). Everything is owner-only. The
+// pre-slot layout under users/{uid}/backups/latest is read and delete only.
+//
+// Nothing is deleted outside a deletion job. The pointer is the control
+// record and no client can ever delete it. Its `deleting` field is one of
+//   'none'     normal;
+//   'cloud'    a cloud-backup-only deletion (the account stays): a tombstone
+//              that can be switched back to 'none' only by an explicit
+//              transition needing recent authentication, no slot manifest and
+//              a higher `epoch`;
+//   'account'  an account deletion: irreversible, there is no transition out.
+// Both tombstones are set only with recent authentication, and either is the
+// one state in which the owner may delete manifests, chunks and legacy
+// documents.
+//
+// The one-a-minute limit on new manifests lives on the pointer too
+// (`lastManifestAt`), because the pointer is never deleted: a manifest can be
+// created or overwritten only in the same batch that moves `lastManifestAt` to
+// the request time, and only a minute after its previous value. Deleting a
+// manifest, or switching a tombstone off, cannot reset it.
+//
+// Every check on a write looks at the state the write leaves behind
+// (getAfter/existsAfter), so a batch cannot pass each check against the old
+// state and commit an inconsistent one.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    function isSlot(slot) {
+      return slot in ['a', 'b'];
+    }
+
+    function pointerDoc(userId) {
+      return /databases/$(database)/documents/users/$(userId)/backup/state;
+    }
+
+    // True while a deletion job owns the backup (before the write): the only
+    // state in which the owner may delete anything.
+    function isDeleting(userId) {
+      return exists(pointerDoc(userId)) && get(pointerDoc(userId)).data.deleting in ['cloud', 'account'];
+    }
+
+    // The same, as the write leaves it. Uploads and publishing need it false.
+    function isDeletingAfter(userId) {
+      return existsAfter(pointerDoc(userId))
+        && getAfter(pointerDoc(userId)).data.deleting in ['cloud', 'account'];
+    }
+
+    // True when the write leaves one of the slot manifests created or
+    // overwritten at the request time (the manifest half of a "touch").
+    function manifestWrittenNow(userId) {
+      return (existsAfter(manifestDoc(userId, 'a'))
+          && getAfter(manifestDoc(userId, 'a')).data.createdAt == request.time)
+        || (existsAfter(manifestDoc(userId, 'b'))
+          && getAfter(manifestDoc(userId, 'b')).data.createdAt == request.time);
+    }
+
+    function isCurrentSlotAfter(userId, slot) {
+      return existsAfter(pointerDoc(userId)) && getAfter(pointerDoc(userId)).data.currentSlot == slot;
+    }
+
+    // Operation epoch. It only ever rises, when a cloud-only deletion is
+    // switched back off, and every manifest carries the epoch it was written in.
+    function epochAfter(userId) {
+      return existsAfter(pointerDoc(userId)) ? getAfter(pointerDoc(userId)).data.epoch : 0;
+    }
+
+    function manifestDoc(userId, slot) {
+      return /databases/$(database)/documents/users/$(userId)/backup/state/slots/$(slot);
+    }
+
+    // Uploading and publishing need a confirmed mailbox. The client refreshes
+    // its ID token after verification so this claim is current.
+    function isVerified() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    // Recent authentication, checked on the server: the token's auth_time (set
+    // by sign-in or re-authentication, not by a token refresh) must be within
+    // the last five minutes. Destructive transitions need it.
+    function isRecentlyAuthenticated() {
+      return request.auth != null
+        && request.auth.token.auth_time is int
+        && request.auth.token.auth_time * 1000 >= request.time.toMillis() - 300000;
+    }
+
+    // Manifest v4. Category counts live inside the ciphertext, so only sizes,
+    // crypto parameters, versions, generation and state are visible here.
+    // 491520 = 480 KiB, the largest raw chunk (640 KB once base64 encoded).
+    function validManifest(data, slot) {
+      return data.keys().hasOnly([
+          'schemaVersion',
+          'storageSchemaVersion',
+          'cryptoVersion',
+          'slot',
+          'createdAt',
+          'compressedByteCount',
+          'chunkCount',
+          'encryptionAlgorithm',
+          'keyDerivation',
+          'iterationCount',
+          'saltBase64',
+          'nonceBase64',
+          'tagBase64',
+          'generationID',
+          'payloadSHA256',
+          'expectedPreviousGenerationID',
+          'epoch',
+          'state'
+        ])
+        && data.keys().hasAll([
+          'schemaVersion',
+          'storageSchemaVersion',
+          'cryptoVersion',
+          'slot',
+          'createdAt',
+          'compressedByteCount',
+          'chunkCount',
+          'encryptionAlgorithm',
+          'keyDerivation',
+          'iterationCount',
+          'saltBase64',
+          'nonceBase64',
+          'tagBase64',
+          'generationID',
+          'payloadSHA256',
+          'expectedPreviousGenerationID',
+          'epoch',
+          'state'
+        ])
+        && data.schemaVersion == 4
+        && data.storageSchemaVersion == 4
+        && data.cryptoVersion == 1
+        && data.slot == slot
+        && data.createdAt is timestamp
+        && data.chunkCount is int
+        && data.chunkCount >= 1
+        && data.chunkCount <= 48
+        && data.compressedByteCount is int
+        && data.compressedByteCount >= 0
+        && data.compressedByteCount <= data.chunkCount * 491520
+        && data.encryptionAlgorithm == 'AES-GCM-256'
+        && data.keyDerivation == 'PBKDF2-HMAC-SHA256'
+        && data.iterationCount is int
+        && data.iterationCount >= 10000
+        && data.iterationCount <= 5000000
+        && data.saltBase64 is string
+        && data.saltBase64.size() == 24
+        && data.nonceBase64 is string
+        && data.nonceBase64.size() == 16
+        && data.tagBase64 is string
+        && data.tagBase64.size() == 24
+        && data.generationID is string
+        && data.generationID.size() >= 1
+        && data.generationID.size() <= 64
+        && data.payloadSHA256 is string
+        && data.payloadSHA256.size() == 64
+        && (data.expectedPreviousGenerationID == null
+            || (data.expectedPreviousGenerationID is string
+                && data.expectedPreviousGenerationID.size() <= 64))
+        && data.epoch is int
+        && data.epoch >= 0
+        && data.state in ['uploading', 'complete'];
+    }
+
+    function validChunk(data, manifest, chunkIndex) {
+      return data.keys().hasOnly(['generationID', 'index', 'payloadBase64', 'sha256'])
+        && data.keys().hasAll(['generationID', 'index', 'payloadBase64', 'sha256'])
+        && data.generationID == manifest.generationID
+        && data.index is int
+        && data.index == chunkIndex
+        && data.payloadBase64 is string
+        && data.payloadBase64.size() <= 655360
+        && data.sha256 is string
+        && data.sha256.size() == 64;
+    }
+
+    function validPointer(data) {
+      return data.keys().hasOnly(['currentSlot', 'generationID', 'updatedAt', 'deleting', 'epoch', 'lastManifestAt'])
+        && data.keys().hasAll(['currentSlot', 'generationID', 'updatedAt', 'deleting', 'epoch', 'lastManifestAt'])
+        && (data.currentSlot == null || data.currentSlot in ['a', 'b'])
+        && (data.generationID == null
+            || (data.generationID is string
+                && data.generationID.size() >= 1
+                && data.generationID.size() <= 64))
+        && data.updatedAt == request.time
+        && data.deleting in ['none', 'cloud', 'account']
+        && data.epoch is int
+        && data.epoch >= 0
+        && data.lastManifestAt is timestamp;
+    }
+
+    // Chunk documents are named by their decimal index, without padding.
+    function isChunkName(name) {
+      return name.matches('^(0|[1-9][0-9]?)$');
+    }
+
+    // -- Pointer -----------------------------------------------------------
+
+    match /users/{userId}/backup/state {
+      allow read: if isOwner(userId);
+
+      // No client ever deletes the pointer. After a deletion it stays as a
+      // tombstone (a deleting mode, no slot, no generation) that holds the
+      // epoch and the rate timestamp and blocks every write.
+      allow delete: if false;
+
+      allow create, update: if isOwner(userId)
+        && validPointer(request.resource.data)
+        && (
+          // Starting deletion (none to cloud or account) or making a cloud
+          // deletion an account deletion: needs recent authentication, clears
+          // the pointer's target so nothing can be published, and keeps the
+          // epoch and the rate timestamp. An account tombstone never changes.
+          (
+            request.resource.data.deleting in ['cloud', 'account']
+            && request.resource.data.currentSlot == null
+            && request.resource.data.generationID == null
+            && isRecentlyAuthenticated()
+            && (resource == null
+                ? (request.resource.data.epoch == 0
+                    && request.resource.data.lastManifestAt == request.time)
+                : ((resource.data.deleting == 'none'
+                        || (resource.data.deleting == 'cloud' && request.resource.data.deleting == 'account'))
+                    && request.resource.data.epoch == resource.data.epoch
+                    && request.resource.data.lastManifestAt == resource.data.lastManifestAt))
+          )
+          ||
+          // Switching a CLOUD deletion off again (the person chose to back up
+          // again): needs recent authentication, both slot manifests gone (as
+          // the write leaves them), and a higher epoch, so an upload that
+          // began before the deletion can no longer publish. An account
+          // tombstone has no way back. The rate timestamp is kept.
+          (
+            resource != null
+            && resource.data.deleting == 'cloud'
+            && request.resource.data.deleting == 'none'
+            && request.resource.data.currentSlot == null
+            && request.resource.data.generationID == null
+            && request.resource.data.epoch == resource.data.epoch + 1
+            && request.resource.data.lastManifestAt == resource.data.lastManifestAt
+            && isRecentlyAuthenticated()
+            && !existsAfter(manifestDoc(userId, 'a'))
+            && !existsAfter(manifestDoc(userId, 'b'))
+          )
+          ||
+          // Recording a manifest: the same batch that creates or overwrites a
+          // slot manifest moves lastManifestAt to the request time, and only
+          // a minute after its previous value. Nothing else about the pointer
+          // changes. The very first upload creates the pointer this way.
+          (
+            request.resource.data.deleting == 'none'
+            && isVerified()
+            && request.resource.data.lastManifestAt == request.time
+            && manifestWrittenNow(userId)
+            && (resource == null
+                ? (request.resource.data.currentSlot == null
+                    && request.resource.data.generationID == null
+                    && request.resource.data.epoch == 0)
+                : (resource.data.deleting == 'none'
+                    && request.resource.data.currentSlot == resource.data.currentSlot
+                    && request.resource.data.generationID == resource.data.generationID
+                    && request.resource.data.epoch == resource.data.epoch
+                    && request.time >= resource.data.lastManifestAt + duration.value(60, 's')))
+          )
+          ||
+          // Publishing: compare-and-swap on generationID. The target slot's
+          // manifest, as the write leaves it, must be complete, carry the
+          // pointer's next generation and epoch, and name the generation it
+          // expects to replace. A batch that also rewrites that manifest fails
+          // here, because the rewritten manifest is what gets checked.
+          (
+            request.resource.data.deleting == 'none'
+            && isVerified()
+            && resource != null
+            && resource.data.deleting == 'none'
+            && request.resource.data.epoch == resource.data.epoch
+            && request.resource.data.lastManifestAt == resource.data.lastManifestAt
+            && isSlot(request.resource.data.currentSlot)
+            && resource.data.currentSlot != request.resource.data.currentSlot
+            && existsAfter(manifestDoc(userId, request.resource.data.currentSlot))
+            && getAfter(manifestDoc(userId, request.resource.data.currentSlot)).data.state == 'complete'
+            && getAfter(manifestDoc(userId, request.resource.data.currentSlot)).data.generationID
+                == request.resource.data.generationID
+            && getAfter(manifestDoc(userId, request.resource.data.currentSlot)).data.expectedPreviousGenerationID
+                == resource.data.generationID
+            && getAfter(manifestDoc(userId, request.resource.data.currentSlot)).data.epoch
+                == request.resource.data.epoch
+          )
+        );
+
+      // -- Slot manifests --------------------------------------------------
+
+      match /slots/{slot} {
+        allow read: if isOwner(userId) && isSlot(slot);
+
+        // Only while a deletion job owns the backup. Recycling an inactive
+        // slot is an overwrite, never a delete; and the one-a-minute limit
+        // is kept on the pointer, so deleting a manifest cannot reset it.
+        allow delete: if isOwner(userId) && isSlot(slot) && isDeleting(userId);
+
+        allow create, update: if isOwner(userId)
+          && isSlot(slot)
+          && isVerified()
+          && !isDeletingAfter(userId)
+          && !isCurrentSlotAfter(userId, slot)
+          && validManifest(request.resource.data, slot)
+          && request.resource.data.epoch == epochAfter(userId)
+          && (
+            // Starting an upload, or replacing this slot's older backup. The
+            // creation time is the server's, so it cannot be back-dated. The
+            // pointer, in the same batch, moves lastManifestAt to this request
+            // time, and a new manifest is accepted only a minute after the
+            // pointer's previous value (either slot), however the earlier
+            // manifest went away.
+            (
+              request.resource.data.state == 'uploading'
+              && request.resource.data.createdAt == request.time
+              && existsAfter(pointerDoc(userId))
+              && getAfter(pointerDoc(userId)).data.lastManifestAt == request.time
+              && (!exists(pointerDoc(userId))
+                  || request.time >= get(pointerDoc(userId)).data.lastManifestAt + duration.value(60, 's'))
+            )
+            ||
+            // Finishing the upload: only the state changes, and only once.
+            (
+              resource != null
+              && resource.data.state == 'uploading'
+              && request.resource.data.state == 'complete'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['state'])
+            )
+          );
+
+        // -- Chunks --------------------------------------------------------
+
+        match /chunks/{chunkName} {
+          allow read: if isOwner(userId) && isSlot(slot);
+          allow delete: if isOwner(userId) && isSlot(slot) && isDeleting(userId);
+
+          // Only while the slot's manifest is 'uploading'. Once it is
+          // 'complete' the chunks are frozen. The manifest is read as the
+          // write leaves it, so a batch cannot complete it around a chunk.
+          allow create, update: if isOwner(userId)
+            && isSlot(slot)
+            && isVerified()
+            && !isDeletingAfter(userId)
+            && isChunkName(chunkName)
+            && existsAfter(manifestDoc(userId, slot))
+            && getAfter(manifestDoc(userId, slot)).data.state == 'uploading'
+            && int(chunkName) < getAfter(manifestDoc(userId, slot)).data.chunkCount
+            && validChunk(request.resource.data, getAfter(manifestDoc(userId, slot)).data, int(chunkName));
+        }
+      }
+    }
+
+    // -- Legacy layout (read and delete only) --------------------------------
+    // Migration reads these and writes the slot layout beside them. They are
+    // deleted only by a deletion job (the pointer is in a deleting mode), so a
+    // stolen session cannot remove them, and a job that runs longer than the
+    // recent-authentication window still finishes.
+
+    match /users/{userId}/backups/latest {
+      allow read: if isOwner(userId);
+      allow delete: if isOwner(userId) && isDeleting(userId);
+
+      match /generations/{generationId} {
+        allow read: if isOwner(userId);
+        allow delete: if isOwner(userId) && isDeleting(userId);
+
+        match /chunks/{chunkId} {
+          allow read: if isOwner(userId);
+          allow delete: if isOwner(userId) && isDeleting(userId);
+        }
+      }
+
+      match /chunks/{chunkId} {
+        allow read: if isOwner(userId);
+        allow delete: if isOwner(userId) && isDeleting(userId);
+      }
+    }
+  }
+}
