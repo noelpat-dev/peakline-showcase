@@ -8,6 +8,11 @@
 ![Source](https://img.shields.io/badge/source-private%20%C2%B7%20on%20request-lightgrey)
 
 <p align="center">
+  <a href="https://github.com/noelpat-dev/peakline-showcase/releases/download/promo-v1/peakline-promo-16x9.mp4"><img src="media/00-promo.gif" width="100%" alt="Peakline promo: a training session draws a topographic map, one contour per set. The last set is a new best, the summit turns alpenglow, and the map rises into a mountain." /></a>
+</p>
+<p align="center"><sub><b>The 15-second promo.</b> Every logged set draws one contour of the map. The last set is a new best, so the summit takes the alpenglow and the map rises into the mountain you climbed. Drawn entirely in code and rendered frame by frame. Watch the full-quality MP4 in <a href="https://github.com/noelpat-dev/peakline-showcase/releases/download/promo-v1/peakline-promo-16x9.mp4">16:9</a> or <a href="https://github.com/noelpat-dev/peakline-showcase/releases/download/promo-v1/peakline-promo-9x16.mp4">9:16 vertical</a>.</sub></p>
+
+<p align="center">
   <img src="media/01-today.png" width="24%" alt="Today: the day drawn as a trail, with readiness and today's route" />
   <img src="media/02-preview.png" width="24%" alt="Workout Preview: the route line and session modes" />
   <img src="media/03-live-logger.png" width="24%" alt="Live logger: one exercise on a contour map with weight and reps scales" />
